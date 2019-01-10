@@ -48,6 +48,8 @@ var (
 	SentinelByte = []byte{'*'}
 )
 
+type Filter func(k []byte) (bool, error)
+
 func fs(tx *bolt.Tx) *bolt.Bucket {
 	return tx.Bucket(b(FsBucket))
 }
@@ -1124,7 +1126,7 @@ func GetRangeFromIndex(r io.Reader, prefix string) (uint64, uint64, error) {
 }
 
 // NewFilter creates a filter for a hashtree shard.
-func NewFilter(numTrees int64, tree int64) func(k []byte) (bool, error) {
+func NewFilter(numTrees int64, tree int64) Filter {
 	return func(k []byte) (bool, error) {
 		if pathToTree(k, numTrees) == uint64(tree) {
 			return true, nil
