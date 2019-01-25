@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/pachyderm/pachyderm/src/client/pkg/grpcutil"
 
@@ -113,10 +114,25 @@ func (c *microsoftClient) IsIgnorable(err error) bool {
 }
 
 type microsoftWriter struct {
-	container  string
-	blob       string
-	blobClient storage.BlobStorageClient
+	container            string
+	blob                 string
+	blobClient           storage.BlobStorageClient
+	blocksChan           chan blockInfo
+	blockWriterWaitGroup *sync.WaitGroup
+	blockCount           int
+	blockWriterErrorChan chan error
 }
+
+type blockInfo struct {
+	id               string
+	name             string
+	container        string
+	data             []byte
+	blockWriterError chan error
+}
+
+const numberOfWorkers = 2
+const writeBlockChannelLen = 2
 
 func newMicrosoftWriter(client *microsoftClient, name string) (*microsoftWriter, error) {
 	// create container
@@ -125,35 +141,87 @@ func newMicrosoftWriter(client *microsoftClient, name string) (*microsoftWriter,
 		return nil, err
 	}
 
-	// create blob
-	err = client.blobClient.CreateBlockBlob(client.container, name)
+	exists, err := client.blobClient.BlobExists(client.container, name)
+
+
 	if err != nil {
 		return nil, err
 	}
 
-	return &microsoftWriter{
-		container:  client.container,
-		blob:       name,
-		blobClient: client.blobClient,
-	}, nil
+	blockCount := 0
+	if exists {
+		blockList, err := client.blobClient.GetBlockList(client.container, name, storage.BlockListTypeAll)
+		if err != nil {
+			return nil, err
+		}
+		blockCount = len(blockList.CommittedBlocks)
+	} else {
+		err = client.blobClient.CreateBlockBlob(client.container, name)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	msWriter := &microsoftWriter{
+		container:            client.container,
+		blob:                 name,
+		blobClient:           client.blobClient,
+		blockWriterErrorChan: make(chan error, writeBlockChannelLen),
+		blockCount:           blockCount,
+	}
+
+	msWriter.startWorkers(numberOfWorkers)
+
+	return msWriter, nil
+}
+
+func (w *microsoftWriter) newBlockInfo(blockOrdinal int, data []byte, length int) blockInfo {
+
+	return blockInfo{
+		id:               base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%011d\n", blockOrdinal))),
+		data:             data[:length],
+		name:             w.blob,
+		container:        w.container,
+		blockWriterError: w.blockWriterErrorChan,
+	}
+}
+
+func (w *microsoftWriter) startWorkers(numOfWorkers int) {
+	wg := sync.WaitGroup{}
+	blockChannel := make(chan blockInfo, writeBlockChannelLen)
+
+	for writers := 0; writers < numOfWorkers; writers++ {
+		go func() {
+			wg.Add(1)
+			defer wg.Done()
+			for {
+				blockInfo, ok := <-blockChannel
+
+				if !ok {
+					break
+				}
+
+				err := w.blobClient.PutBlock(blockInfo.container, blockInfo.name, blockInfo.id, blockInfo.data)
+				grpcutil.PutBuffer(blockInfo.data)
+				if err != nil {
+					select {
+					case blockInfo.blockWriterError <- err:
+					default:
+					}
+				}
+			}
+		}()
+	}
+
+	w.blocksChan = blockChannel
+	w.blockWriterWaitGroup = &wg
 }
 
 func (w *microsoftWriter) Write(b []byte) (int, error) {
-	blockList, err := w.blobClient.GetBlockList(w.container, w.blob, storage.BlockListTypeAll)
-	if err != nil {
-		return 0, err
-	}
-
-	blocksLen := len(blockList.CommittedBlocks)
-	amendList := []storage.Block{}
-	for _, v := range blockList.CommittedBlocks {
-		amendList = append(amendList, storage.Block{v.Name, storage.BlockStatusCommitted})
-	}
 
 	inputSourceReader := bytes.NewReader(b)
-	chunk := grpcutil.GetBuffer()
-	defer grpcutil.PutBuffer(chunk)
 	for {
+		chunk := grpcutil.GetBuffer()
 		n, err := inputSourceReader.Read(chunk)
 		if err == io.EOF {
 			break
@@ -161,26 +229,34 @@ func (w *microsoftWriter) Write(b []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-
-		blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%011d\n", blocksLen)))
-		data := chunk[:n]
-		err = w.blobClient.PutBlock(w.container, w.blob, blockID, data)
-		if err != nil {
-			return 0, fmt.Errorf("BlobStorageClient.PutBlock: %v", err)
+		select {
+		case w.blocksChan <- w.newBlockInfo(w.blockCount, chunk, n):
+			w.blockCount++
+		case err := <-w.blockWriterErrorChan:
+			return n, err
 		}
-		// add current uncommitted block to temporary block list
-		amendList = append(amendList, storage.Block{blockID, storage.BlockStatusUncommitted})
-		blocksLen++
-	}
-
-	// update block list to blob committed block list.
-	err = w.blobClient.PutBlockList(w.container, w.blob, amendList)
-	if err != nil {
-		return 0, fmt.Errorf("BlobStorageClient.PutBlockList: %v", err)
 	}
 	return len(b), nil
 }
 
 func (w *microsoftWriter) Close() error {
+	close(w.blocksChan)
+	w.blockWriterWaitGroup.Wait()
+	select {
+	case err := <-w.blockWriterErrorChan:
+		return err
+	default:
+	}
+
+	blockList := make([]storage.Block, w.blockCount)
+
+	for blockOrdinal := 0; blockOrdinal < w.blockCount; blockOrdinal++ {
+		blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%011d\n", blockOrdinal)))
+		blockList[blockOrdinal] = storage.Block{ID: blockID, Status: storage.BlockStatusUncommitted}
+	}
+	err := w.blobClient.PutBlockList(w.container, w.blob, blockList)
+	if err != nil {
+		return fmt.Errorf("BlobStorageClient.PutBlockList: %v", err)
+	}
 	return nil
 }
